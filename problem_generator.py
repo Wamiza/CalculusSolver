@@ -134,8 +134,45 @@ def generate_multivar_diff():
     return src_terms, ans_terms, var, 7  # rule_id 7 = partial_derivative
 
 
+# ── Phase 2 additions: trig / exp / log templates ───────────────────────────
+# These use vocab.json v1.2's new OP:sin / OP:cos / OP:tan / OP:exp / OP:ln
+# tokens (added after ID 99, see docs/KNOWN_ISSUES.md). Only sin, exp, and ln
+# are generated here — cos and tan differentiation are NOT included because
+# their correct derivatives (-sin(x) and sec^2(x)) cannot be represented
+# without a sign/coeff field on op-nodes (cos) or a sec token (tan), neither
+# of which exists in tokenizer/slang_serializer.py today. Generating them
+# would silently produce mathematically incorrect training labels.
+
+def generate_sin_diff(var="x"):
+    """d/dvar[sin(var)] = cos(var). Coefficient is always 1 -- the op-node
+    schema has no coeff/sign field, so only unscaled sin(var) is safe to
+    represent, not e.g. 3*sin(var)."""
+    inner = {"numi": {"terms": [{"coeff": 1, "var": {var: 1}}]}, "deno": 1}
+    src = {"op": "sin", "expr": inner}
+    ans = {"op": "cos", "expr": inner}
+    return src, ans, 1  # rule_id 1 = chain_rule (closest existing label; see KNOWN_ISSUES.md note)
+
+
+def generate_exp_diff(var="x"):
+    """d/dvar[exp(var)] = exp(var). Self-derivative -- no sign/coeff issue,
+    safe to represent exactly."""
+    inner = {"numi": {"terms": [{"coeff": 1, "var": {var: 1}}]}, "deno": 1}
+    src = {"op": "exp", "expr": inner}
+    ans = {"op": "exp", "expr": inner}
+    return src, ans, 1  # rule_id 1 = chain_rule (closest existing label; see KNOWN_ISSUES.md note)
+
+
+def generate_ln_diff(var="x"):
+    """d/dvar[ln(var)] = 1/var. The answer is a plain fraction -- no function
+    node needed at all, fully representable with zero ambiguity."""
+    inner = {"numi": {"terms": [{"coeff": 1, "var": {var: 1}}]}, "deno": 1}
+    src = {"op": "ln", "expr": inner}
+    ans = {"numi": {"terms": [{"coeff": 1}]}, "deno": {"terms": [{"coeff": 1, "var": {var: 1}}]}}
+    return src, ans, 1  # rule_id 1 = chain_rule (closest existing label; see KNOWN_ISSUES.md note)
+
+
 def generate_slang_dataset():
-    print("[Dataset Engine] Programmatically synthesizing 100k-row expanded SLaNg dataset...")
+    print("[Dataset Engine] Programmatically synthesizing expanded SLaNg dataset...")
     splits_dir = Path("data/splits")
     splits_dir.mkdir(parents=True, exist_ok=True)
 
@@ -148,7 +185,10 @@ def generate_slang_dataset():
     # 10k constant terms
     # 10k negative exponent
     # 20k multi-variable partial derivatives
-    # Total: 100k
+    # 5k sin differentiation      (Phase 2)
+    # 5k exp differentiation      (Phase 2)
+    # 5k ln differentiation       (Phase 2)
+    # Total: 115k
 
     # 1. Single-term power rule (35k)
     for _ in range(35000):
@@ -167,10 +207,6 @@ def generate_slang_dataset():
     for _ in range(25000):
         var = random.choice(VARIABLES[:1])
         src_terms, ans_terms, rule_id = generate_multi_term_diff(var)
-        # Wrap as single expression: use first term as the src expr
-        # For multi-term, we use the first term as op node expr
-        # and the answer is the first derivative term
-        # (The model sees individual term-level examples)
         src_op = {"op": "diff", "var": var, "expr": src_terms[0]}
         dataset.append({
             "src_tokens": src_op,
@@ -218,13 +254,55 @@ def generate_slang_dataset():
             "verification_state": 1,
         })
 
+    # 6. Trig — sin (5k) — Phase 2 addition
+    for _ in range(5000):
+        var = random.choice(VARIABLES[:1])  # x only, for now
+        src, ans, rule_id = generate_sin_diff(var)
+        src_op = {"op": "diff", "var": var, "expr": src}
+        dataset.append({
+            "src_tokens": src_op,
+            "tgt_input_tokens": ans,
+            "tgt_output_tokens": ans,
+            "rule_ids": rule_id,
+            "verification_state": 1,
+        })
+
+    # 7. Exponential — exp (5k) — Phase 2 addition
+    for _ in range(5000):
+        var = random.choice(VARIABLES[:1])
+        src, ans, rule_id = generate_exp_diff(var)
+        src_op = {"op": "diff", "var": var, "expr": src}
+        dataset.append({
+            "src_tokens": src_op,
+            "tgt_input_tokens": ans,
+            "tgt_output_tokens": ans,
+            "rule_ids": rule_id,
+            "verification_state": 1,
+        })
+
+    # 8. Logarithmic — ln (5k) — Phase 2 addition
+    for _ in range(5000):
+        var = random.choice(VARIABLES[:1])
+        src, ans, rule_id = generate_ln_diff(var)
+        src_op = {"op": "diff", "var": var, "expr": src}
+        dataset.append({
+            "src_tokens": src_op,
+            "tgt_input_tokens": ans,
+            "tgt_output_tokens": ans,
+            "rule_ids": rule_id,
+            "verification_state": 1,
+        })
+
     random.shuffle(dataset)
 
     with open("data/slang_dataset.jsonl", "w", encoding="utf-8") as f:
         for item in dataset:
             f.write(json.dumps(item) + "\n")
 
-    for name, split_data in [("train", dataset[:90000]), ("val", dataset[90000:95000]), ("test", dataset[95000:])]:
+    total = len(dataset)
+    train_end = int(total * 0.90)
+    val_end = int(total * 0.95)
+    for name, split_data in [("train", dataset[:train_end]), ("val", dataset[train_end:val_end]), ("test", dataset[val_end:])]:
         with open(splits_dir / f"{name}.jsonl", "w", encoding="utf-8") as f:
             for item in split_data:
                 f.write(json.dumps(item) + "\n")
@@ -235,7 +313,7 @@ def generate_slang_dataset():
         rid = item["rule_ids"]
         rule_counts[rid] = rule_counts.get(rid, 0) + 1
 
-    print(f"[Dataset Engine] 100,000 expanded lines generated successfully.")
+    print(f"[Dataset Engine] {total} expanded lines generated successfully.")
     print(f"   Rule distribution: {rule_counts}")
     print(f"   Coefficient range: {min(SAFE_COEFFS)} to {max(SAFE_COEFFS)}")
     print(f"   Exponent range: {min(SAFE_EXPONENTS)} to {max(SAFE_EXPONENTS)}")
